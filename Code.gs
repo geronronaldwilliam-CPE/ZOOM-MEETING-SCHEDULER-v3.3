@@ -35,6 +35,26 @@ const BOOKING_HEADERS = ['id','title','name','agency','date','shift','start','en
 
 const ACCOUNT_HEADERS = ['id','name','capacity','status','email','expiry','notes','created'];
 
+/* Columns that hold date/time strings (YYYY-MM-DD or HH:MM). Google Sheets
+   auto-detects these and silently converts them into real Date objects,
+   which then get serialized back to the browser as full ISO timestamps
+   like "2026-07-08T16:00:00.000Z" instead of "2026-07-08" — and shifted
+   to UTC, which can even bump the date by a day. That breaks every place
+   script.js compares dates as plain strings (calendar, conflict checks,
+   getEffDates), so bookings that ARE on the sheet look like they "didn't
+   sync." Setting these columns' number format to plain text prevents the
+   auto-conversion at the source. */
+const BOOKING_DATE_COLS = ['date','start','end','submitted'];
+const ACCOUNT_DATE_COLS = ['expiry','created'];
+
+function forcePlainTextColumns(sheet, headers, dateCols){
+  dateCols.forEach(function(col){
+    const idx = headers.indexOf(col);
+    if(idx<0) return;
+    sheet.getRange(1, idx+1, sheet.getMaxRows(), 1).setNumberFormat('@STRING@');
+  });
+}
+
 /* ── One-time setup: creates the 3 tabs + seeds default data ── */
 function setupSheets(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -42,6 +62,7 @@ function setupSheets(){
   const bookingsSheet = ss.getSheetByName('Bookings') || ss.insertSheet('Bookings');
   bookingsSheet.clear();
   bookingsSheet.appendRow(BOOKING_HEADERS);
+  forcePlainTextColumns(bookingsSheet, BOOKING_HEADERS, BOOKING_DATE_COLS);
   const defaultBookings = [
     ['BK-001','ICT Summit 2026','Ana Reyes','DICT IV-A','2026-07-07','AM','07:00','12:00','100','ACC-001',false,'',0,'','APPROVED','2026-06-28',''],
     ['BK-002','Data Privacy Seminar','Ben Cruz','NPC','2026-07-10','BOTH','07:00','18:00','300','ACC-002',false,'',0,'Projector','PENDING','2026-06-30',''],
@@ -54,6 +75,7 @@ function setupSheets(){
   const accountsSheet = ss.getSheetByName('Accounts') || ss.insertSheet('Accounts');
   accountsSheet.clear();
   accountsSheet.appendRow(ACCOUNT_HEADERS);
+  forcePlainTextColumns(accountsSheet, ACCOUNT_HEADERS, ACCOUNT_DATE_COLS);
   const defaultAccounts = [
     ['ACC-001','Account Name 1','100','active','zoom-100@yourdomain.com','2027-01-01','Primary 100-pax license.','2026-01-01'],
     ['ACC-002','Account Name 2','300','active','zoom-300@yourdomain.com','2027-01-01','Used for large seminars.','2026-01-01'],
@@ -77,14 +99,35 @@ function getSheet(name){
   return sheet;
 }
 
+/* Undo Sheets' auto-conversion for values that were already turned into
+   real Date objects before the plain-text column format was in place
+   (i.e. existing rows saved before this fix). Converts back to the plain
+   "YYYY-MM-DD" or "HH:MM" string form script.js expects, using LOCAL
+   time (not UTC) so dates don't shift by a day. Leaves already-plain
+   strings untouched. */
+function normalizeDateLikeValue(val, isTimeOnly){
+  if(!(val instanceof Date)) return val;
+  const tz = Session.getScriptTimeZone() || SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  if(isTimeOnly) return Utilities.formatDate(val, tz, 'HH:mm');
+  return Utilities.formatDate(val, tz, 'yyyy-MM-dd');
+}
+
 function sheetToObjects(sheet, headers){
   const values = sheet.getDataRange().getValues();
   values.shift(); // drop header row
+  const timeCols = {start:true, end:true};
   return values
     .filter(row=>row[0]!=='') // skip blank rows
     .map(row=>{
       const obj = {};
-      headers.forEach((h,i)=>{ obj[h] = row[i]; });
+      headers.forEach((h,i)=>{
+        let v = row[i];
+        if(BOOKING_DATE_COLS.indexOf(h)>=0 || ACCOUNT_DATE_COLS.indexOf(h)>=0){
+          v = normalizeDateLikeValue(v, !!timeCols[h]);
+        }
+        if(h==='pax' && v!==''){ v = String(v); }
+        obj[h] = v;
+      });
       // Sheets stores booleans/numbers natively; JSON.stringify handles them fine.
       // Normalize blanks back to empty string (Sheets sometimes gives them as '').
       if('autoDeniedBy' in obj && !obj.autoDeniedBy) delete obj.autoDeniedBy;
@@ -95,10 +138,58 @@ function sheetToObjects(sheet, headers){
 function objectsToSheet(sheet, headers, arr){
   sheet.clear();
   sheet.appendRow(headers);
+  const dateCols = sheet.getName()==='Bookings' ? BOOKING_DATE_COLS : ACCOUNT_DATE_COLS;
+  forcePlainTextColumns(sheet, headers, dateCols);
   if(arr.length){
     const rows = arr.map(o=>headers.map(h=>o[h] === undefined || o[h] === null ? '' : o[h]));
     sheet.getRange(2,1,rows.length,headers.length).setValues(rows);
   }
+}
+
+/* Merge-safe write for Bookings: instead of blindly overwriting the sheet
+   with whatever list a single device happened to have in localStorage
+   (which caused bookings from other devices to silently disappear when
+   two people used the app around the same time), this:
+     1) generates a real server-side ID for any incoming booking that
+        doesn't already have one that exists on the sheet, so two devices
+        never stomp on each other with a duplicate "next number" ID, and
+     2) upserts each incoming booking by id into the FULL current sheet
+        contents, rather than replacing the sheet outright.
+   Returns the merged array (including freshly assigned ids) so the
+   caller can hand real IDs back to the browser that submitted them. */
+function upsertBookings(incoming){
+  const sheet = getSheet('Bookings');
+  const existing = sheetToObjects(sheet, BOOKING_HEADERS);
+  const byId = {};
+  existing.forEach(function(o){ byId[o.id]=o; });
+
+  var maxNum = 0;
+  existing.forEach(function(o){
+    var m = /^BK-(\d+)$/.exec(o.id||'');
+    if(m) maxNum = Math.max(maxNum, parseInt(m[1],10));
+  });
+
+  var assigned = [];
+  incoming.forEach(function(o){
+    var id = o.id;
+    var looksLikeRealId = id && /^BK-\d+$/.test(id) && byId[id];
+    if(!looksLikeRealId){
+      maxNum += 1;
+      id = 'BK-'+String(maxNum).padStart(3,'0');
+    }
+    var rec = Object.assign({}, o, { id: id });
+    byId[id] = rec;
+    assigned.push(rec);
+  });
+
+  var merged = existing.slice();
+  assigned.forEach(function(rec){
+    var idx = merged.findIndex(function(o){ return o.id===rec.id; });
+    if(idx>=0) merged[idx]=rec; else merged.push(rec);
+  });
+
+  objectsToSheet(sheet, BOOKING_HEADERS, merged);
+  return assigned;
 }
 
 function jsonOut(obj){
@@ -133,8 +224,19 @@ function doPost(e){
     const payload = body.payload;
 
     if(action==='saveBookings'){
-      objectsToSheet(getSheet('Bookings'), BOOKING_HEADERS, payload);
-      return jsonOut({ ok:true });
+      // payload is the full array the browser has locally. We no longer
+      // trust it as the whole truth (a device with a stale local cache
+      // would otherwise erase other devices' newer bookings) — instead we
+      // upsert each row by id into whatever is currently on the sheet.
+      const merged = upsertBookings(payload);
+      return jsonOut({ ok:true, bookings: merged });
+    }
+    if(action==='addBooking'){
+      // Preferred path for creating a single new booking: payload is one
+      // booking object (id may be blank). The server assigns a real id
+      // and appends it without touching any other rows.
+      const assigned = upsertBookings([payload]);
+      return jsonOut({ ok:true, booking: assigned[0] });
     }
     if(action==='saveAccounts'){
       objectsToSheet(getSheet('Accounts'), ACCOUNT_HEADERS, payload);
