@@ -5,7 +5,7 @@ const EMAILJS_PK  = 'YOUR_PUBLIC_KEY';
 const EMAILJS_SVC = 'YOUR_SERVICE_ID';
 const EMAILJS_TPL = 'YOUR_TEMPLATE_ID';
 const DEFAULT_ADMIN_EMAIL = 'admin@yourdomain.com';
-const ADMIN_PASSWORD = '123admin'; // ← change this!
+const ADMIN_PASSWORD = 'admin123'; // ← change this!
 
 /* ═══════════════════════════════════════════════════════════
    GOOGLE SHEETS DATABASE (via Apps Script Web App)
