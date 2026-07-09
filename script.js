@@ -34,7 +34,20 @@ async function dbFetch(action, method, payload){
     return await res.json();
   }catch(e){ console.warn('Sheet DB sync failed ('+action+'):', e); return null; }
 }
-function pushBookingsToDB(arr){ dbFetch('saveBookings','POST',arr); }
+function pushBookingsToDB(arr){
+  // The backend now merges (upserts by id) instead of overwriting the
+  // whole sheet, so a device with a slightly stale local cache can no
+  // longer erase bookings another device already saved. It also hands
+  // back the authoritative merged list (with server-assigned ids), which
+  // we adopt into localStorage so this device immediately agrees with
+  // the shared sheet instead of waiting for the next pullFromDB().
+  dbFetch('saveBookings','POST',arr).then(res=>{
+    if(res && Array.isArray(res.bookings)){
+      localStorage.setItem('zms_bookings', JSON.stringify(res.bookings));
+      bookings = res.bookings;
+    }
+  });
+}
 function pushAccountsToDB(arr){ dbFetch('saveAccounts','POST',arr); }
 function pushAdminEmailToDB(v){ dbFetch('setAdminEmail','POST',{email:v}); }
 
@@ -763,20 +776,43 @@ function proceedWithBookingSubmit(){
 function finalizeBookingSubmit(data){
   const {name,agency,title,date,start,end,pax,notes,recur,accountId,freq,count} = data;
   bookings = loadBookings();
-  const newId = 'BK-'+String(bookings.length+1).padStart(3,'0');
-  const bk = {id:newId,title,name,agency,date,shift:selShiftV,start,end,pax,accountId,
+  // Provisional id — used instantly for local display so the UI still
+  // updates with zero delay. If the Sheet backend is reachable, it will
+  // assign the REAL id (avoiding collisions with bookings other devices
+  // created around the same time) and we adopt that below.
+  const provisionalId = 'BK-'+String(bookings.length+1).padStart(3,'0');
+  const bk = {id:provisionalId,title,name,agency,date,shift:selShiftV,start,end,pax,accountId,
     recurring:recur,freq:recur?freq:'',count:recur?count:0,notes,
     status:'PENDING',submitted:toLocalISODate(new Date())};
 
   bookings.unshift(bk);
-  saveBookings(bookings);
+  localStorage.setItem('zms_bookings', JSON.stringify(bookings));
   sendEmail(bk);
+
+  // Ask the backend to add this single booking. It assigns the
+  // authoritative id and merges it into the shared sheet without
+  // touching any other rows, then hands back the id it actually used.
+  dbFetch('addBooking','POST',bk).then(res=>{
+    if(res && res.booking){
+      const idx = bookings.findIndex(b=>b.id===provisionalId);
+      if(idx>=0 && res.booking.id!==provisionalId){
+        bookings[idx] = res.booking;
+        localStorage.setItem('zms_bookings', JSON.stringify(bookings));
+        if(document.getElementById('req-tbody')) renderTable();
+      }
+    } else {
+      // Sheet unreachable / not configured — fall back to the old
+      // whole-array push so localStorage-only mode keeps working exactly
+      // as before.
+      pushBookingsToDB(bookings);
+    }
+  });
 
   ['f-name','f-agency','f-title','f-notes'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('recur-tog').checked=false;
   document.getElementById('recur-box').classList.remove('show');
 
-  showToast(`Request ${newId} submitted! Awaiting admin approval.`,'success');
+  showToast(`Request ${provisionalId} submitted! Awaiting admin approval.`,'success');
   renderCal();
   switchTab('existing',document.querySelectorAll('.m-tab')[1]);
 }
